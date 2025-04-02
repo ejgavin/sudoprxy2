@@ -1,24 +1,39 @@
 import { getBodyBuffer } from '@/utils/body';
-import { getProxyHeaders, getAfterResponseHeaders, getBlacklistedHeaders } from '@/utils/headers';
-import { createTokenIfNeeded, isAllowedToMakeRequest, setTokenHeader } from '@/utils/turnstile';
-import { specificProxyRequest, handleExternalResource } from '@/utils/proxy';
+import {
+  getProxyHeaders,
+  getAfterResponseHeaders,
+  getBlacklistedHeaders,
+} from '@/utils/headers';
+import {
+  createTokenIfNeeded,
+  isAllowedToMakeRequest,
+  setTokenHeader,
+} from '@/utils/turnstile';
+import { specificProxyRequest } from '@/utils/proxy';
+import { H3Event } from 'h3';
 
-export default defineEventHandler(async (event) => {
-  // handle CORS, if applicable
+export default defineEventHandler(async (event: H3Event) => {
+  // Handle CORS for preflight requests
   if (isPreflightRequest(event)) return handleCors(event, {});
 
-  // parse destination URL
+  // Get the destination URL from the query string
   const destination = getQuery<{ destination?: string }>(event).destination;
-  if (!destination)
+  if (!destination) {
+    // Return a message if no destination URL is provided
     return await sendJson({
       event,
       status: 200,
       data: {
-        message: `Proxy is working as expected (v${useRuntimeConfig(event).version})`,
+        message: 'Please provide a destination URL using the "destination" query parameter.',
       },
     });
+  }
 
-  if (!(await isAllowedToMakeRequest(event)))
+  // Log the destination for debugging purposes
+  console.log('Received destination:', destination);
+
+  // Check if the request is allowed (e.g., based on headers or tokens)
+  if (!(await isAllowedToMakeRequest(event))) {
     return await sendJson({
       event,
       status: 401,
@@ -26,34 +41,48 @@ export default defineEventHandler(async (event) => {
         error: 'Invalid or missing token',
       },
     });
+  }
 
-  // Read body
+  // Read body if needed (for POST, PUT, etc.)
   const body = await getBodyBuffer(event);
   const token = await createTokenIfNeeded(event);
 
-  // Route for external resources like CSS or JS
-  if (destination.endsWith('.css') || destination.endsWith('.js')) {
-    return await handleExternalResource(event, destination);
-  }
-
-  // Proxy the main content (iframe embedding)
   try {
+    // Make the proxy request to the destination
     await specificProxyRequest(event, destination, {
       blacklistedHeaders: getBlacklistedHeaders(),
       fetchOptions: {
-        redirect: 'follow',
-        headers: getProxyHeaders(event.headers),
+        method: event.method,
         body,
+        headers: getProxyHeaders(event.headers),
       },
       onResponse(outputEvent, response) {
+        // Modify response headers as needed
         const headers = getAfterResponseHeaders(response.headers, response.url);
         setResponseHeaders(outputEvent, headers);
         if (token) setTokenHeader(event, token);
       },
     });
-  } catch (e) {
-    console.log('Error fetching', e);
-    throw e;
+
+    // Return a success response
+    return await sendJson({
+      event,
+      status: 200,
+      data: {
+        message: 'Request to the destination was successful.',
+      },
+    });
+
+  } catch (error) {
+    // Catch and log any errors during the proxy request
+    console.error('Error during proxy request:', error);
+    return await sendJson({
+      event,
+      status: 500,
+      data: {
+        error: 'An error occurred while processing the request.',
+      },
+    });
   }
 });
 
