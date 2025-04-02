@@ -1,84 +1,101 @@
-import { H3Event, ProxyOptions, getProxyRequestHeaders, sendProxy } from 'h3';
+import {
+  H3Event,
+  ProxyOptions,
+  getProxyRequestHeaders,
+  RequestHeaders,
+} from 'h3';
 
-// Function to handle proxying requests for external resources (CSS/JS)
-export async function handleExternalResource(
-  event: H3Event,
-  target: string,
-  opts: ProxyOptions = {}
+const PayloadMethods = new Set(['PATCH', 'POST', 'PUT', 'DELETE']);
+
+// Merge headers function to combine multiple headers
+function mergeHeaders(
+  defaults: HeadersInit,
+  ...inputs: (HeadersInit | RequestHeaders | undefined)[]
 ) {
-  const fetchHeaders = new Headers(event.headers);
-
-  // Ensure headers are set for proper content types (e.g., for CSS/JS)
-  fetchHeaders.set('Accept', 'application/javascript, application/json, text/css, text/html, */*');
-  fetchHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/93.0');
-  
-  const response = await fetch(target, {
-    method: 'GET',
-    headers: fetchHeaders,
-  });
-
-  // Handle responses properly, especially for CSS/JS resources
-  const contentType = response.headers.get('Content-Type') || '';
-
-  if (contentType.includes('text/css')) {
-    // Handle CSS resources
-    return new Response(await response.text(), {
-      status: response.status,
-      headers: {
-        'Content-Type': 'text/css',
-        'Cache-Control': 'max-age=31536000',  // Cache for 1 year
-      },
-    });
-  } else if (contentType.includes('application/javascript')) {
-    // Handle JavaScript resources
-    return new Response(await response.text(), {
-      status: response.status,
-      headers: {
-        'Content-Type': 'application/javascript',
-        'Cache-Control': 'max-age=31536000',
-      },
-    });
-  } else {
-    // Default response for other content types
-    return new Response(await response.text(), {
-      status: response.status,
-      headers: {
-        'Content-Type': contentType,
-      },
-    });
+  const _inputs = inputs.filter(Boolean) as HeadersInit[];
+  if (_inputs.length === 0) {
+    return defaults;
   }
+  const merged = new Headers(defaults);
+  for (const input of _inputs) {
+    if (input.entries) {
+      for (const [key, value] of (input.entries as any)()) {
+        if (value !== undefined) {
+          merged.set(key, value);
+        }
+      }
+    } else {
+      for (const [key, value] of Object.entries(input)) {
+        if (value !== undefined) {
+          merged.set(key, value);
+        }
+      }
+    }
+  }
+  return merged;
 }
 
-// Function to handle the main proxy request
+// Function to handle the proxy request
 export async function specificProxyRequest(
   event: H3Event,
   target: string,
-  opts: ProxyOptions = {}
+  opts: ProxyOptions = {},
 ) {
+  let body;
+  let duplex;
+  if (PayloadMethods.has(event.method)) {
+    if (opts.streamRequest) {
+      body = getRequestWebStream(event);
+      duplex = 'half';
+    } else {
+      body = await readRawBody(event, false).catch(() => undefined);
+    }
+  }
+
   const method = opts.fetchOptions?.method || event.method;
   const oldHeaders = getProxyRequestHeaders(event);
-  
-  // Ensure headers are set for proper content types
-  const fetchHeaders = new Headers(oldHeaders);
-  fetchHeaders.set('Accept', 'application/json, text/html, */*');
-  fetchHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/93.0');
 
-  const response = await fetch(target, {
-    method,
-    headers: fetchHeaders,
-  });
+  // Temporary fix for encoding issues (e.g., netlify changing encoding headers)
+  if (oldHeaders['accept-encoding']?.includes('zstd')) {
+    oldHeaders['accept-encoding'] = oldHeaders['accept-encoding']
+      .split(',')
+      .map((x: string) => x.trim())
+      .filter((x: string) => x !== 'zstd')
+      .join(', ');
+  }
 
-  const contentType = response.headers.get('Content-Type') || '';
-  
-  if (contentType.includes('text/html')) {
-    return new Response(await response.text(), {
-      status: response.status,
-      headers: {
-        'Content-Type': 'text/html',
+  // Merge headers with any additional fetch options
+  const fetchHeaders = mergeHeaders(
+    oldHeaders,
+    opts.fetchOptions?.headers,
+    opts.headers,
+  );
+
+  const headerObj = Object.fromEntries([...(fetchHeaders.entries as any)()]);
+  if (process.env.REQ_DEBUG === 'true') {
+    console.log({
+      type: 'request',
+      method,
+      url: target,
+      headers: headerObj,
+    });
+  }
+
+  // Send the actual request and proxy the response
+  try {
+    return await sendProxy(event, target, {
+      ...opts,
+      fetchOptions: {
+        method,
+        body,
+        duplex,
+        ...opts.fetchOptions,
+        headers: fetchHeaders,
       },
     });
-  } else {
-    return handleExternalResource(event, target, opts);  // Use handleExternalResource for CSS/JS
+  } catch (error) {
+    console.log('Error during proxy request:', error);
+    throw new Error('Failed to proxy request');
   }
 }
 
