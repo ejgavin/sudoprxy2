@@ -9,30 +9,26 @@ import {
   isAllowedToMakeRequest,
   setTokenHeader,
 } from '@/utils/turnstile';
-import { specificProxyRequest } from '@/utils/proxy';
 import { H3Event } from 'h3';
+import { sendJson } from '@/utils/sending';
 
-export default defineEventHandler(async (event: H3Event) => {
-  // Handle CORS for preflight requests
+export default defineEventHandler(async (event) => {
+  // Handle CORS if applicable
   if (isPreflightRequest(event)) return handleCors(event, {});
 
-  // Get the destination URL from the query string
+  // Parse the destination URL from the query
   const destination = getQuery<{ destination?: string }>(event).destination;
   if (!destination) {
-    // Return a message if no destination URL is provided
     return await sendJson({
       event,
-      status: 200,
+      status: 400,
       data: {
-        message: 'Please provide a destination URL using the "destination" query parameter.',
+        error: 'Destination URL is required',
       },
     });
   }
 
-  // Log the destination for debugging purposes
-  console.log('Received destination:', destination);
-
-  // Check if the request is allowed (e.g., based on headers or tokens)
+  // Check if the request is allowed (Token validation)
   if (!(await isAllowedToMakeRequest(event))) {
     return await sendJson({
       event,
@@ -43,46 +39,37 @@ export default defineEventHandler(async (event: H3Event) => {
     });
   }
 
-  // Read body if needed (for POST, PUT, etc.)
+  // Read the body for any additional data if necessary
   const body = await getBodyBuffer(event);
   const token = await createTokenIfNeeded(event);
 
-  try {
-    // Make the proxy request to the destination
-    await specificProxyRequest(event, destination, {
-      blacklistedHeaders: getBlacklistedHeaders(),
-      fetchOptions: {
-        method: event.method,
-        body,
-        headers: getProxyHeaders(event.headers),
-      },
-      onResponse(outputEvent, response) {
-        // Modify response headers as needed
-        const headers = getAfterResponseHeaders(response.headers, response.url);
-        setResponseHeaders(outputEvent, headers);
-        if (token) setTokenHeader(event, token);
-      },
-    });
+  // Create the embed HTML to display the destination content
+  const embedHTML = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Embedded Content</title>
+      <style>
+        body { margin: 0; padding: 0; }
+        iframe { width: 100%; height: 100vh; border: none; }
+      </style>
+    </head>
+    <body>
+      <iframe src="${destination}" frameborder="0"></iframe>
+    </body>
+    </html>
+  `;
 
-    // Return a success response
-    return await sendJson({
-      event,
-      status: 200,
-      data: {
-        message: 'Request to the destination was successful.',
-      },
-    });
-
-  } catch (error) {
-    // Catch and log any errors during the proxy request
-    console.error('Error during proxy request:', error);
-    return await sendJson({
-      event,
-      status: 500,
-      data: {
-        error: 'An error occurred while processing the request.',
-      },
-    });
-  }
+  // Send the embedded HTML as a response
+  return await sendJson({
+    event,
+    status: 200,
+    data: {
+      message: 'Embedding content from the destination URL.',
+      html: embedHTML,
+    },
+  });
 });
 
